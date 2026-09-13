@@ -17,17 +17,27 @@ import (
 	"github.com/skyhook-io/radar/internal/k8s"
 )
 
-const maxYAMLPreviewRequestBytes = 6 << 20
+// The limit Radar advertises, and the only one stated in bytes of YAML. Apply
+// carries the content raw so its body cap is this number; preview carries it
+// JSON-escaped, so it checks this against the decoded field instead.
+const maxYAMLContentBytes = 6 << 20
+
+// Transport only. JSON escaping makes the encoded envelope larger than the
+// document it carries — newlines become \n, quotes and backslashes double — so
+// bounding the envelope at the document limit would reject manifests apply
+// accepts. This covers the escaping a manifest actually incurs, a few percent,
+// with room to spare; a document made almost entirely of quotes could still
+// exceed it and is refused with the same size error.
+const maxYAMLPreviewRequestBytes = 8 << 20
+
 const maxYAMLPreviewDocuments = 100
 
 // Matches the preview document cap: the same bundle must not be reviewable on
 // one route and refused on the other.
 const maxYAMLApplyDocuments = 100
 
-// Matches the preview cap. The two routes carry the same manifests, and JSON
-// escaping makes preview's effective YAML ceiling a couple of percent lower —
-// close enough that a second number would cost more than it explains.
-const maxYAMLApplyRequestBytes = 6 << 20
+// The apply body is the document, so the body cap is the document limit.
+const maxYAMLApplyRequestBytes = maxYAMLContentBytes
 
 var secretKindDeclaration = regexp.MustCompile(`(?im)(?:^|[,{])[ \t]*["']?kind["']?[ \t]*:(?:[ \t]*["']?secret["']?(?:[ \t\r]*(?:[,}#]|$))|[ \t\r]*\n[ \t]+["']?secret["']?(?:[ \t\r]*(?:#|$)))`)
 
@@ -88,6 +98,14 @@ func (s *Server) handlePreviewResources(w http.ResponseWriter, r *http.Request) 
 	}
 	if strings.TrimSpace(req.YAML) == "" {
 		s.writeError(w, http.StatusBadRequest, "yaml is required")
+		return
+	}
+	// The envelope bound above is about transport. This is the limit users are
+	// told about, checked against the document rather than its encoding so that
+	// preview and apply refuse the same manifests.
+	if len(req.YAML) > maxYAMLContentBytes {
+		s.writeError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("YAML is too large to review — the limit is %d MiB", maxYAMLContentBytes>>20))
 		return
 	}
 	if req.Mode == "" {

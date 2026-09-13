@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -327,13 +328,6 @@ func TestReadBoundedTextBodyRejectsOversizeBodyWith413(t *testing.T) {
 	}
 }
 
-func TestApplyRequestLimitMatchesPreview(t *testing.T) {
-	if maxYAMLApplyRequestBytes != maxYAMLPreviewRequestBytes {
-		t.Fatalf("apply limit = %d, preview limit = %d; the two routes carry the same YAML and must agree",
-			maxYAMLApplyRequestBytes, maxYAMLPreviewRequestBytes)
-	}
-}
-
 // A body that is too big is not a malformed request: nothing has parsed the
 // YAML at this point, so "invalid preview request" sends the user to debug
 // syntax that may be perfectly fine.
@@ -416,5 +410,76 @@ func TestApplyDocumentLimitMatchesPreview(t *testing.T) {
 	if maxYAMLApplyDocuments != maxYAMLPreviewDocuments {
 		t.Fatalf("apply documents = %d, preview documents = %d; the two routes must refuse the same bundles",
 			maxYAMLApplyDocuments, maxYAMLPreviewDocuments)
+	}
+}
+
+// The limit Radar advertises is an amount of YAML. Apply carries it raw, so its
+// body cap states it directly; preview carries it JSON-escaped inside an
+// envelope, so the envelope must be the looser of the two or preview rejects
+// manifests apply would have taken.
+func TestPreviewEnvelopeExceedsTheYAMLLimit(t *testing.T) {
+	if maxYAMLPreviewRequestBytes <= maxYAMLContentBytes {
+		t.Fatalf("envelope = %d, yaml limit = %d; the envelope must leave room for JSON escaping",
+			maxYAMLPreviewRequestBytes, maxYAMLContentBytes)
+	}
+	if maxYAMLApplyRequestBytes != maxYAMLContentBytes {
+		t.Fatalf("apply body = %d, yaml limit = %d; apply carries the YAML raw and must state the same limit",
+			maxYAMLApplyRequestBytes, maxYAMLContentBytes)
+	}
+}
+
+// The boundary the reviewer asked for: a file at the advertised limit has to
+// survive review, not 413 somewhere short of it because of escaping.
+func TestPreviewAcceptsYAMLAtTheAdvertisedLimit(t *testing.T) {
+	prevConn := k8s.GetConnectionStatus()
+	k8s.SetConnectionStatus(k8s.ConnectionStatus{State: k8s.StateConnected})
+	t.Cleanup(func() { k8s.SetConnectionStatus(prevConn) })
+
+	// Real manifest shape, padded to exactly the limit, with the newlines that
+	// make the encoded envelope larger than the document.
+	head := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: big\ndata:\n  payload: "
+	doc := head + strings.Repeat("a\n    ", (maxYAMLContentBytes-len(head))/6)
+	doc += strings.Repeat("a", maxYAMLContentBytes-len(doc))
+
+	body, err := json.Marshal(yamlPreviewRequest{YAML: doc, Mode: "apply"})
+	if err != nil {
+		t.Fatalf("marshal preview request: %v", err)
+	}
+	if len(body) <= maxYAMLContentBytes {
+		t.Fatalf("encoded body = %d bytes, want it to exceed the %d byte YAML limit — otherwise this proves nothing",
+			len(body), maxYAMLContentBytes)
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest("POST", "/api/resources/preview", bytes.NewReader(body))
+	(&Server{}).handlePreviewResources(recorder, request)
+
+	if recorder.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = 413 for a document at the advertised limit: %s", recorder.Body.String())
+	}
+}
+
+func TestPreviewRejectsYAMLOverTheLimitDespiteAFittingEnvelope(t *testing.T) {
+	prevConn := k8s.GetConnectionStatus()
+	k8s.SetConnectionStatus(k8s.ConnectionStatus{State: k8s.StateConnected})
+	t.Cleanup(func() { k8s.SetConnectionStatus(prevConn) })
+
+	// Plain text, so the envelope stays well under its own bound while the
+	// document itself is over the limit — the case only a decoded check catches.
+	oversize := strings.Repeat("a", maxYAMLContentBytes+1)
+	body, err := json.Marshal(yamlPreviewRequest{YAML: oversize, Mode: "apply"})
+	if err != nil {
+		t.Fatalf("marshal preview request: %v", err)
+	}
+	if len(body) > maxYAMLPreviewRequestBytes {
+		t.Fatalf("envelope = %d bytes, over its own bound; this test would pass for the wrong reason", len(body))
+	}
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest("POST", "/api/resources/preview", bytes.NewReader(body))
+	(&Server{}).handlePreviewResources(recorder, request)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusRequestEntityTooLarge)
 	}
 }
