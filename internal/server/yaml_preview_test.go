@@ -289,3 +289,132 @@ spec:
 		t.Fatalf("parsed non-Secret YAML was hidden: %q", doc.SubmittedYAML)
 	}
 }
+
+func TestReadBoundedTextBodyAcceptsBodyWithinLimit(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest("POST", "/", strings.NewReader("kind: ConfigMap\n"))
+
+	body, ok := (&Server{}).readBoundedTextBody(recorder, request, 64)
+	if !ok {
+		t.Fatalf("readBoundedTextBody() ok = false, want true (status %d)", recorder.Code)
+	}
+	if body != "kind: ConfigMap\n" {
+		t.Fatalf("body = %q, want the request body unchanged", body)
+	}
+}
+
+// An unbounded io.ReadAll on the apply route is a footgun once a file picker
+// feeds it: the caller should learn the body is too large, not have Radar
+// buffer it first and then fail with a generic read error.
+func TestReadBoundedTextBodyRejectsOversizeBodyWith413(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest("POST", "/", strings.NewReader(strings.Repeat("x", 128)))
+
+	if _, ok := (&Server{}).readBoundedTextBody(recorder, request, 64); ok {
+		t.Fatal("readBoundedTextBody() ok = true, want false for an oversize body")
+	}
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusRequestEntityTooLarge)
+	}
+	var response struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal error response: %v", err)
+	}
+	if !strings.Contains(response.Error, "too large") {
+		t.Fatalf("error = %q, want it to say the body is too large", response.Error)
+	}
+}
+
+func TestApplyRequestLimitMatchesPreview(t *testing.T) {
+	if maxYAMLApplyRequestBytes != maxYAMLPreviewRequestBytes {
+		t.Fatalf("apply limit = %d, preview limit = %d; the two routes carry the same YAML and must agree",
+			maxYAMLApplyRequestBytes, maxYAMLPreviewRequestBytes)
+	}
+}
+
+// A body that is too big is not a malformed request: nothing has parsed the
+// YAML at this point, so "invalid preview request" sends the user to debug
+// syntax that may be perfectly fine.
+func TestHandlePreviewResourcesRejectsOversizeBodyWith413(t *testing.T) {
+	prevConn := k8s.GetConnectionStatus()
+	k8s.SetConnectionStatus(k8s.ConnectionStatus{State: k8s.StateConnected})
+	t.Cleanup(func() { k8s.SetConnectionStatus(prevConn) })
+
+	oversize := `{"yaml":"` + strings.Repeat("x", maxYAMLPreviewRequestBytes) + `"}`
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest("POST", "/api/resources/preview", strings.NewReader(oversize))
+
+	(&Server{}).handlePreviewResources(recorder, request)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusRequestEntityTooLarge)
+	}
+	var response struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal error response: %v", err)
+	}
+	if strings.Contains(response.Error, "invalid preview request") {
+		t.Fatalf("error = %q, want a size message rather than a malformed-request one", response.Error)
+	}
+	if !strings.Contains(response.Error, "too large") {
+		t.Fatalf("error = %q, want it to say the body is too large", response.Error)
+	}
+}
+
+// The cap has to hold at the route, not only in the helper: /resources/apply is
+// the surface a file picker points at, and the body is the manifest itself.
+func TestHandleApplyResourceRejectsOversizeBody(t *testing.T) {
+	prevConn := k8s.GetConnectionStatus()
+	k8s.SetConnectionStatus(k8s.ConnectionStatus{State: k8s.StateConnected})
+	t.Cleanup(func() { k8s.SetConnectionStatus(prevConn) })
+
+	oversize := strings.Repeat("x", maxYAMLApplyRequestBytes+1)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest("POST", "/api/resources/apply", strings.NewReader(oversize))
+
+	(&Server{}).handleApplyResource(recorder, request)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+// The byte cap alone still admits a small body holding tens of thousands of
+// documents. Preview already refuses those; apply refusing them too is what
+// stops the two routes disagreeing about the same bundle.
+func TestHandleApplyResourceRejectsTooManyDocuments(t *testing.T) {
+	prevConn := k8s.GetConnectionStatus()
+	k8s.SetConnectionStatus(k8s.ConnectionStatus{State: k8s.StateConnected})
+	t.Cleanup(func() { k8s.SetConnectionStatus(prevConn) })
+
+	doc := "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: n\n"
+	body := strings.Repeat(doc+"---\n", maxYAMLApplyDocuments+1)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest("POST", "/api/resources/apply", strings.NewReader(body))
+
+	(&Server{}).handleApplyResource(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	var response struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal error response: %v", err)
+	}
+	if !strings.Contains(response.Error, "at most") {
+		t.Fatalf("error = %q, want it to name the document limit", response.Error)
+	}
+}
+
+func TestApplyDocumentLimitMatchesPreview(t *testing.T) {
+	if maxYAMLApplyDocuments != maxYAMLPreviewDocuments {
+		t.Fatalf("apply documents = %d, preview documents = %d; the two routes must refuse the same bundles",
+			maxYAMLApplyDocuments, maxYAMLPreviewDocuments)
+	}
+}

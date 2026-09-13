@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,15 @@ import (
 
 const maxYAMLPreviewRequestBytes = 6 << 20
 const maxYAMLPreviewDocuments = 100
+
+// Matches the preview document cap: the same bundle must not be reviewable on
+// one route and refused on the other.
+const maxYAMLApplyDocuments = 100
+
+// Matches the preview cap. The two routes carry the same manifests, and JSON
+// escaping makes preview's effective YAML ceiling a couple of percent lower —
+// close enough that a second number would cost more than it explains.
+const maxYAMLApplyRequestBytes = 6 << 20
 
 var secretKindDeclaration = regexp.MustCompile(`(?im)(?:^|[,{])[ \t]*["']?kind["']?[ \t]*:(?:[ \t]*["']?secret["']?(?:[ \t\r]*(?:[,}#]|$))|[ \t\r]*\n[ \t]+["']?secret["']?(?:[ \t\r]*(?:#|$)))`)
 
@@ -65,6 +75,14 @@ func (s *Server) handlePreviewResources(w http.ResponseWriter, r *http.Request) 
 
 	var req yamlPreviewRequest
 	if err := decodeBoundedJSONBody(w, r, maxYAMLPreviewRequestBytes, &req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			// Quote the apply limit, not this route's envelope allowance —
+			// that is the number the user can act on.
+			s.writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("YAML is too large to review — the limit is %d MiB", maxYAMLApplyRequestBytes>>20))
+			return
+		}
 		s.writeError(w, http.StatusBadRequest, "invalid preview request: "+err.Error())
 		return
 	}
@@ -208,6 +226,28 @@ func decodeBoundedJSONBody(w http.ResponseWriter, r *http.Request, limit int64, 
 		return err
 	}
 	return nil
+}
+
+// readBoundedTextBody reads a raw YAML request body, capping it before the read
+// rather than after. /resources/apply takes the manifest as the body itself, so
+// an unbounded read would let a single request decide how much memory Radar
+// spends on it.
+func (s *Server) readBoundedTextBody(w http.ResponseWriter, r *http.Request, limit int64) (string, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	defer r.Body.Close()
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			s.writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("YAML is too large — the limit is %d MiB", limit>>20))
+			return "", false
+		}
+		s.writeError(w, http.StatusBadRequest, "failed to read request body")
+		return "", false
+	}
+	return string(body), true
 }
 
 func previewDocumentIdentity(index int, content string) yamlPreviewDocument {
