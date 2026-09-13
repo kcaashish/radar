@@ -86,10 +86,38 @@ export function CreateResourceDialog({
   const [drag, setDrag] = useState<FileDragState>('none')
   const [pendingImport, setPendingImport] = useState<{ fileName: string; yaml: string } | null>(null)
   const [importing, setImporting] = useState<string | null>(null)
+  // An import is several awaits and several frames long. Anything that changes
+  // what the result should land on — a newer import, a close, a reopen — bumps
+  // the generation, and every deferred step checks it before touching state.
+  const importGeneration = useRef(0)
+  const scheduledFrames = useRef(new Set<number>())
+  // The buffer as it stands now, not as it stood when a read began.
+  const yamlRef = useRef(yaml)
   const fileInputRef = useRef<HTMLInputElement>(null)
   // dragenter/dragleave also fire for the editor's own descendants, so the
   // overlay tracks depth rather than the first dragleave it sees.
   const dragDepth = useRef(0)
+
+  useEffect(() => {
+    yamlRef.current = yaml
+  }, [yaml])
+
+  const retireDeferredImports = useCallback(() => {
+    importGeneration.current += 1
+    for (const id of scheduledFrames.current) cancelAnimationFrame(id)
+    scheduledFrames.current.clear()
+  }, [])
+
+  useEffect(() => retireDeferredImports, [retireDeferredImports])
+
+  const scheduleFrame = useCallback((generation: number, run: () => void) => {
+    const id = requestAnimationFrame(() => {
+      scheduledFrames.current.delete(id)
+      if (generation !== importGeneration.current) return
+      run()
+    })
+    scheduledFrames.current.add(id)
+  }, [])
 
   useEffect(() => {
     if (!open) return
@@ -105,16 +133,20 @@ export function CreateResourceDialog({
     setPendingImport(null)
     setImporting(null)
     dragDepth.current = 0
-  }, [open, initialYaml])
+    retireDeferredImports()
+  }, [open, initialYaml, retireDeferredImports])
 
   const pending = isApplying || isPreviewing
   const closeNow = useCallback(() => {
+    retireDeferredImports()
     setError(null)
     setSuccess(null)
     setPreview(null)
+    setPendingImport(null)
+    setImporting(null)
     setYaml('')
     onClose()
-  }, [onClose])
+  }, [onClose, retireDeferredImports])
   const handleClose = useCallback(() => {
     if (!pending) closeNow()
   }, [closeNow, pending])
@@ -151,33 +183,40 @@ export function CreateResourceDialog({
   // frames: the first commits it, the second lets the browser paint it. A
   // spinner would only freeze mid-turn, so this says what is happening instead
   // of pretending to animate.
-  const loadIntoEditor = useCallback((fileName: string, content: string) => {
-    setImporting(fileName)
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        setYaml(content)
-        // Clearing it in this same callback would batch it into the very render
-        // that blocks, retiring the status while the editor is still unusable.
-        // Wait for a frame to arrive on time instead: that is the editor
-        // answering again, which is what the status was promising.
-        let previous = performance.now()
-        const clearWhenResponsive = () => {
-          const now = performance.now()
-          if (now - previous < responsiveFrameMs) {
-            setImporting(null)
-            return
+  const loadIntoEditor = useCallback(
+    (fileName: string, content: string, generation: number) => {
+      setImporting(fileName)
+      scheduleFrame(generation, () => {
+        scheduleFrame(generation, () => {
+          setYaml(content)
+          // Clearing it in this same callback would batch it into the very
+          // render that blocks, retiring the status while the editor is still
+          // unusable. Wait for a frame to arrive on time instead: that is the
+          // editor answering again, which is what the status was promising.
+          let previous = performance.now()
+          const clearWhenResponsive = () => {
+            const now = performance.now()
+            if (now - previous < responsiveFrameMs) {
+              setImporting(null)
+              return
+            }
+            previous = now
+            scheduleFrame(generation, clearWhenResponsive)
           }
-          previous = now
-          requestAnimationFrame(clearWhenResponsive)
-        }
-        requestAnimationFrame(clearWhenResponsive)
+          scheduleFrame(generation, clearWhenResponsive)
+        })
       })
-    })
-  }, [])
+    },
+    [scheduleFrame],
+  )
 
   const loadFiles = useCallback(
     async (files: File[]) => {
+      const generation = ++importGeneration.current
       const result = await readYamlFile(files)
+      // A newer import, a close or a reopen happened while this one was
+      // reading; its result describes an editor that has moved on.
+      if (generation !== importGeneration.current) return
       if (!result.ok) {
         setSuccess(null)
         setError(result.message)
@@ -185,13 +224,13 @@ export function CreateResourceDialog({
       }
       setError(null)
       setSuccess(null)
-      if (needsReplaceConfirmation(yaml, initialYaml)) {
+      if (needsReplaceConfirmation(yamlRef.current, initialYaml)) {
         setPendingImport({ fileName: result.fileName, yaml: result.yaml })
         return
       }
-      loadIntoEditor(result.fileName, result.yaml)
+      loadIntoEditor(result.fileName, result.yaml, generation)
     },
-    [yaml, initialYaml, loadIntoEditor],
+    [initialYaml, loadIntoEditor],
   )
 
   const handleDragEnter = useCallback((event: ReactDragEvent) => {
@@ -523,7 +562,13 @@ export function CreateResourceDialog({
         open={pendingImport !== null}
         onClose={() => setPendingImport(null)}
         onConfirm={() => {
-          if (pendingImport) loadIntoEditor(pendingImport.fileName, pendingImport.yaml)
+          // Confirming is its own decision about the editor as it stands now,
+          // so it loads under a fresh generation rather than the one the read
+          // started under, which anything since may have retired.
+          if (pendingImport) {
+            const generation = ++importGeneration.current
+            loadIntoEditor(pendingImport.fileName, pendingImport.yaml, generation)
+          }
           setPendingImport(null)
         }}
         variant="warning"
