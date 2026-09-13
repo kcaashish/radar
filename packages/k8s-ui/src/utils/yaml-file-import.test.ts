@@ -6,8 +6,14 @@ import {
   readYamlFile,
 } from './yaml-file-import'
 
-function drag(items: Array<{ kind: string; type: string }>): DataTransfer {
-  return { items } as unknown as DataTransfer
+function drag(items: Array<{ kind: string; type: string }>, types: string[] = []): DataTransfer {
+  return { items, types } as unknown as DataTransfer
+}
+
+// Safari keeps the dragged items protected until the drop, so `items` is empty
+// mid-drag; only `types` reports that files are coming.
+function safariDrag(types: string[]): DataTransfer {
+  return { items: [], types } as unknown as DataTransfer
 }
 
 const MULTI_DOC = `apiVersion: v1
@@ -157,5 +163,27 @@ describe('needsReplaceConfirmation', () => {
 
   it('treats a whitespace-only difference as nothing worth protecting', () => {
     expect(needsReplaceConfirmation(`${SKELETON}\n  \n`, SKELETON)).toBe(false)
+  })
+})
+
+describe('describeFileDrag across browsers', () => {
+  it('sees a file drag in Safari, where items stay empty until the drop', () => {
+    expect(describeFileDrag(safariDrag(['Files']))).toBe('file')
+  })
+
+  it('still ignores a Safari text drag, which advertises no Files type', () => {
+    expect(describeFileDrag(safariDrag(['text/plain']))).toBe('none')
+  })
+
+  it('counts files when the browser does expose them alongside the Files type', () => {
+    const dragged = drag(
+      [
+        { kind: 'file', type: '' },
+        { kind: 'file', type: '' },
+      ],
+      ['Files'],
+    )
+
+    expect(describeFileDrag(dragged)).toBe('multiple-files')
   })
 })

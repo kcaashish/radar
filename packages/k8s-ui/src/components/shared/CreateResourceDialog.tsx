@@ -18,6 +18,10 @@ import {
   type FileDragState,
 } from '../../utils/yaml-file-import'
 
+// A frame this close to the last one means the main thread is keeping up; a
+// blocked editor produces gaps far larger.
+const responsiveFrameMs = 100
+
 export interface ApplyResult {
   name: string
   namespace: string
@@ -81,6 +85,7 @@ export function CreateResourceDialog({
   } | null>(null)
   const [drag, setDrag] = useState<FileDragState>('none')
   const [pendingImport, setPendingImport] = useState<{ fileName: string; yaml: string } | null>(null)
+  const [importing, setImporting] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   // dragenter/dragleave also fire for the editor's own descendants, so the
   // overlay tracks depth rather than the first dragleave it sees.
@@ -98,6 +103,7 @@ export function CreateResourceDialog({
     setPreview(null)
     setDrag('none')
     setPendingImport(null)
+    setImporting(null)
     dragDepth.current = 0
   }, [open, initialYaml])
 
@@ -140,6 +146,35 @@ export function CreateResourceDialog({
     [closeNow, onCreated],
   )
 
+  // Handing a document to the editor parses the whole buffer and blocks the
+  // main thread, so the status has to be on screen before that starts. Two
+  // frames: the first commits it, the second lets the browser paint it. A
+  // spinner would only freeze mid-turn, so this says what is happening instead
+  // of pretending to animate.
+  const loadIntoEditor = useCallback((fileName: string, content: string) => {
+    setImporting(fileName)
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        setYaml(content)
+        // Clearing it in this same callback would batch it into the very render
+        // that blocks, retiring the status while the editor is still unusable.
+        // Wait for a frame to arrive on time instead: that is the editor
+        // answering again, which is what the status was promising.
+        let previous = performance.now()
+        const clearWhenResponsive = () => {
+          const now = performance.now()
+          if (now - previous < responsiveFrameMs) {
+            setImporting(null)
+            return
+          }
+          previous = now
+          requestAnimationFrame(clearWhenResponsive)
+        }
+        requestAnimationFrame(clearWhenResponsive)
+      })
+    })
+  }, [])
+
   const loadFiles = useCallback(
     async (files: File[]) => {
       const result = await readYamlFile(files)
@@ -154,9 +189,9 @@ export function CreateResourceDialog({
         setPendingImport({ fileName: result.fileName, yaml: result.yaml })
         return
       }
-      setYaml(result.yaml)
+      loadIntoEditor(result.fileName, result.yaml)
     },
-    [yaml, initialYaml],
+    [yaml, initialYaml, loadIntoEditor],
   )
 
   const handleDragEnter = useCallback((event: ReactDragEvent) => {
@@ -366,6 +401,13 @@ export function CreateResourceDialog({
                 onValidate={handleValidate}
                 schemaLoader={schemaLoader}
               />
+              {importing && (
+                <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-md border border-theme-border bg-theme-base/85">
+                  <span className="text-sm font-medium text-theme-text-primary">
+                    Loading {importing}…
+                  </span>
+                </div>
+              )}
               {drag !== 'none' && (
                 <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-md border-2 border-dashed border-accent bg-theme-base/85">
                   <span className="flex items-center gap-2 text-sm font-medium text-theme-text-primary">
@@ -481,7 +523,7 @@ export function CreateResourceDialog({
         open={pendingImport !== null}
         onClose={() => setPendingImport(null)}
         onConfirm={() => {
-          if (pendingImport) setYaml(pendingImport.yaml)
+          if (pendingImport) loadIntoEditor(pendingImport.fileName, pendingImport.yaml)
           setPendingImport(null)
         }}
         variant="warning"

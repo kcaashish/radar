@@ -1,6 +1,8 @@
-// The same limit /resources/apply enforces, so the number in this message is
-// the number the server uses. Preview carries its own larger allowance for JSON
-// escaping precisely so this stays the only limit anyone has to know about.
+// The same limit /resources/apply enforces, so the number in this message is the
+// number the server uses. Loading the file blocks the main thread while the
+// editor parses the buffer — around 90ms at 128 KiB, 460ms at 1 MiB, 2.4s at
+// 5.5 MiB — which the import covers with a loading state rather than by capping
+// below what the server would accept.
 export const MAX_YAML_FILE_BYTES = 6 * 1024 * 1024
 
 const YAML_EXTENSIONS = ['.yaml', '.yml'] as const
@@ -64,14 +66,23 @@ export async function readYamlFile(
 export type FileDragState = 'none' | 'file' | 'multiple-files'
 
 export function describeFileDrag(transfer: DataTransfer | null | undefined): FileDragState {
-  const items = transfer?.items
-  if (!items) return 'none'
+  if (!transfer) return 'none'
+
+  // Safari keeps the dragged items protected until the drop, so `items` is
+  // empty for the whole drag. Every browser advertises "Files" in `types`
+  // though, which makes that the signal for whether files are coming; `items`
+  // only adds the count, where the browser is willing to give one.
+  const carriesFiles = transfer.types ? Array.from(transfer.types).includes('Files') : false
 
   let files = 0
-  for (let index = 0; index < items.length; index++) {
-    if (items[index].kind === 'file') files++
+  const items = transfer.items
+  if (items) {
+    for (let index = 0; index < items.length; index++) {
+      if (items[index].kind === 'file') files++
+    }
   }
-  if (files === 0) return 'none'
+
+  if (!carriesFiles && files === 0) return 'none'
   return files > 1 ? 'multiple-files' : 'file'
 }
 
