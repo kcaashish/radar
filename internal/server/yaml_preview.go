@@ -22,13 +22,20 @@ import (
 // JSON-escaped, so it checks this against the decoded field instead.
 const maxYAMLContentBytes = 6 << 20
 
-// Transport only. JSON escaping makes the encoded envelope larger than the
-// document it carries — newlines become \n, quotes and backslashes double — so
-// bounding the envelope at the document limit would reject manifests apply
-// accepts. This covers the escaping a manifest actually incurs, a few percent,
-// with room to spare; a document made almost entirely of quotes could still
-// exceed it and is refused with the same size error.
-const maxYAMLPreviewRequestBytes = 8 << 20
+// Transport only, and deliberately twice the content limit rather than a margin
+// chosen for comfort: twice is the ceiling the grammar allows. JSON escaping
+// doubles `"` and `\`, and YAML 1.2 admits no raw C0 control character in
+// content except tab and newline, which also escape to two bytes; every other
+// byte survives encoding unchanged. So no valid document within the content
+// limit can fail to fit here, and preview never refuses a manifest apply would
+// have taken. Sizing it for typical escaping instead would strand real files —
+// a minified JSON blob inside a ConfigMap is close to half quotes.
+//
+// The slack is the envelope's own bytes: the field names, the braces and the
+// optional target. Doubling the content alone leaves a document that escapes to
+// exactly the limit failing on the wrapper around it.
+const maxYAMLPreviewEnvelopeSlackBytes = 64 << 10
+const maxYAMLPreviewRequestBytes = 2*maxYAMLContentBytes + maxYAMLPreviewEnvelopeSlackBytes
 
 const maxYAMLPreviewDocuments = 100
 

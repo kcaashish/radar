@@ -417,9 +417,17 @@ func TestApplyDocumentLimitMatchesPreview(t *testing.T) {
 // body cap states it directly; preview carries it JSON-escaped inside an
 // envelope, so the envelope must be the looser of the two or preview rejects
 // manifests apply would have taken.
-func TestPreviewEnvelopeExceedsTheYAMLLimit(t *testing.T) {
-	if maxYAMLPreviewRequestBytes <= maxYAMLContentBytes {
-		t.Fatalf("envelope = %d, yaml limit = %d; the envelope must leave room for JSON escaping",
+//
+// Twice is not a margin picked for comfort, it is the ceiling the grammar
+// allows. JSON escaping doubles `"` and `\`, and YAML 1.2 admits no raw C0
+// control character in content except tab and newline, which also escape to two
+// bytes. Every other byte survives encoding unchanged, so no valid YAML document
+// can more than double. Anything less leaves manifests that apply accepts and
+// preview refuses — a minified JSON blob inside a ConfigMap is nearly half
+// quotes and clears a smaller margin easily.
+func TestPreviewEnvelopeAbsorbsWorstCaseEscaping(t *testing.T) {
+	if maxYAMLPreviewRequestBytes <= 2*maxYAMLContentBytes {
+		t.Fatalf("envelope = %d, yaml limit = %d; the envelope must hold the worst-case encoding — twice the content, plus the wrapper around it",
 			maxYAMLPreviewRequestBytes, maxYAMLContentBytes)
 	}
 	if maxYAMLApplyRequestBytes != maxYAMLContentBytes {
@@ -481,5 +489,30 @@ func TestPreviewRejectsYAMLOverTheLimitDespiteAFittingEnvelope(t *testing.T) {
 
 	if recorder.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+// The bound above, exercised rather than asserted: a document at the limit made
+// entirely of characters that double under JSON encoding.
+func TestPreviewAcceptsFullyEscapedYAMLAtTheLimit(t *testing.T) {
+	prevConn := k8s.GetConnectionStatus()
+	k8s.SetConnectionStatus(k8s.ConnectionStatus{State: k8s.StateConnected})
+	t.Cleanup(func() { k8s.SetConnectionStatus(prevConn) })
+
+	worstCase := strings.Repeat(`"`, maxYAMLContentBytes)
+	body, err := json.Marshal(yamlPreviewRequest{YAML: worstCase, Mode: "apply"})
+	if err != nil {
+		t.Fatalf("marshal preview request: %v", err)
+	}
+	t.Logf("encoded body = %d bytes against a %d byte envelope", len(body), maxYAMLPreviewRequestBytes)
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest("POST", "/api/resources/preview", bytes.NewReader(body))
+	(&Server{}).handlePreviewResources(recorder, request)
+
+	// It is not valid YAML and will be refused on its content, but never for
+	// its size — the envelope has to carry it that far.
+	if recorder.Code == http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = 413 for a document at the limit whose encoding doubled it: %s", recorder.Body.String())
 	}
 }
