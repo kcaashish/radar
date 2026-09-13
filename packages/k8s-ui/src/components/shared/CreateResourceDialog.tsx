@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
-import { AlertTriangle, Check, ChevronDown, ChevronRight, Loader2, X } from 'lucide-react'
+import { useCallback, useEffect, useRef, useState, type DragEvent as ReactDragEvent } from 'react'
+import { AlertTriangle, Check, ChevronDown, ChevronRight, Loader2, Upload, X } from 'lucide-react'
+import { ConfirmDialog } from '../ui/ConfirmDialog'
 import { DialogPortal } from '../ui/DialogPortal'
 import { YamlEditor, type YamlSchemaLoader } from '../ui/YamlEditor'
 import {
@@ -9,6 +10,13 @@ import {
 } from '../ui/YamlReview'
 import { Tooltip } from '../ui/Tooltip'
 import { formatApplyError } from '../../utils/k8s-errors'
+import {
+  describeFileDrag,
+  needsReplaceConfirmation,
+  readYamlFile,
+  YAML_FILE_ACCEPT,
+  type FileDragState,
+} from '../../utils/yaml-file-import'
 
 export interface ApplyResult {
   name: string
@@ -71,6 +79,12 @@ export function CreateResourceDialog({
     nonAtomic: boolean
     context?: string
   } | null>(null)
+  const [drag, setDrag] = useState<FileDragState>('none')
+  const [pendingImport, setPendingImport] = useState<{ fileName: string; yaml: string } | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  // dragenter/dragleave also fire for the editor's own descendants, so the
+  // overlay tracks depth rather than the first dragleave it sees.
+  const dragDepth = useRef(0)
 
   useEffect(() => {
     if (!open) return
@@ -82,6 +96,9 @@ export function CreateResourceDialog({
     setError(null)
     setSuccess(null)
     setPreview(null)
+    setDrag('none')
+    setPendingImport(null)
+    dragDepth.current = 0
   }, [open, initialYaml])
 
   const pending = isApplying || isPreviewing
@@ -121,6 +138,59 @@ export function CreateResourceDialog({
       }
     },
     [closeNow, onCreated],
+  )
+
+  const loadFiles = useCallback(
+    async (files: File[]) => {
+      const result = await readYamlFile(files)
+      if (!result.ok) {
+        setSuccess(null)
+        setError(result.message)
+        return
+      }
+      setError(null)
+      setSuccess(null)
+      if (needsReplaceConfirmation(yaml, initialYaml)) {
+        setPendingImport({ fileName: result.fileName, yaml: result.yaml })
+        return
+      }
+      setYaml(result.yaml)
+    },
+    [yaml, initialYaml],
+  )
+
+  const handleDragEnter = useCallback((event: ReactDragEvent) => {
+    const state = describeFileDrag(event.dataTransfer)
+    if (state === 'none') return
+    event.preventDefault()
+    dragDepth.current += 1
+    setDrag(state)
+  }, [])
+
+  const handleDragOver = useCallback((event: ReactDragEvent) => {
+    if (describeFileDrag(event.dataTransfer) === 'none') return
+    // Without this the browser navigates away to the dropped file.
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'copy'
+  }, [])
+
+  const handleDragLeave = useCallback((event: ReactDragEvent) => {
+    if (describeFileDrag(event.dataTransfer) === 'none') return
+    dragDepth.current = Math.max(0, dragDepth.current - 1)
+    if (dragDepth.current === 0) setDrag('none')
+  }, [])
+
+  const handleDrop = useCallback(
+    (event: ReactDragEvent) => {
+      if (describeFileDrag(event.dataTransfer) === 'none') return
+      event.preventDefault()
+      dragDepth.current = 0
+      setDrag('none')
+      // The DataTransfer is neutered once this handler returns, so take the
+      // files off it before anything awaits.
+      void loadFiles(Array.from(event.dataTransfer.files))
+    },
+    [loadFiles],
   )
 
   const handleSubmit = useCallback(async () => {
@@ -256,13 +326,57 @@ export function CreateResourceDialog({
           </div>
 
           <div className="min-h-0 flex-1 px-5 py-3">
-            <YamlEditor
-              value={yaml}
-              onChange={setYaml}
-              height="400px"
-              onValidate={handleValidate}
-              schemaLoader={schemaLoader}
-            />
+            <div className="mb-2 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="flex items-center gap-1.5 rounded-md border border-theme-border px-2.5 py-1 text-xs font-medium text-theme-text-secondary transition-colors hover:bg-theme-hover hover:text-theme-text-primary"
+              >
+                <Upload className="h-3.5 w-3.5" />
+                Import YAML file
+              </button>
+              <span className="text-xs text-theme-text-tertiary">
+                or drop a YAML file into the editor
+              </span>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept={YAML_FILE_ACCEPT}
+                className="hidden"
+                onChange={(event) => {
+                  const picked = Array.from(event.target.files ?? [])
+                  // Clearing the input empties its FileList, so read it first.
+                  event.target.value = ''
+                  void loadFiles(picked)
+                }}
+              />
+            </div>
+
+            <div
+              className="relative h-[400px]"
+              onDragEnter={handleDragEnter}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+            >
+              <YamlEditor
+                value={yaml}
+                onChange={setYaml}
+                height="400px"
+                onValidate={handleValidate}
+                schemaLoader={schemaLoader}
+              />
+              {drag !== 'none' && (
+                <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-md border-2 border-dashed border-accent bg-theme-base/85">
+                  <span className="flex items-center gap-2 text-sm font-medium text-theme-text-primary">
+                    <Upload className="h-4 w-4" />
+                    {drag === 'multiple-files'
+                      ? 'Drop a single YAML file'
+                      : 'Drop YAML file to load'}
+                  </span>
+                </div>
+              )}
+            </div>
           </div>
 
           {(error || previewError) && (
@@ -362,6 +476,20 @@ export function CreateResourceDialog({
           </div>
         </>
       )}
+
+      <ConfirmDialog
+        open={pendingImport !== null}
+        onClose={() => setPendingImport(null)}
+        onConfirm={() => {
+          if (pendingImport) setYaml(pendingImport.yaml)
+          setPendingImport(null)
+        }}
+        variant="warning"
+        showWarning={false}
+        title="Replace editor contents?"
+        message={`Loading ${pendingImport?.fileName ?? 'this file'} discards the YAML currently in the editor.`}
+        confirmLabel="Replace"
+      />
     </DialogPortal>
   )
 }
