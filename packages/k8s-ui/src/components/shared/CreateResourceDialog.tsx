@@ -217,6 +217,11 @@ export function CreateResourceDialog({
       // A newer import, a close or a reopen happened while this one was
       // reading; its result describes an editor that has moved on.
       if (generation !== importGeneration.current) return
+      // This import owns the status from here. Taking the generation retired
+      // the frames that would have cleared a previous import's overlay, so
+      // every path out of this function has to leave it in a sane state — the
+      // ones that return early below would otherwise strand it on screen.
+      setImporting(null)
       if (!result.ok) {
         setSuccess(null)
         setError(result.message)
